@@ -1,12 +1,13 @@
 from pathlib import Path
-
-import cv2
-import numpy as np
+import subprocess
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
-import subprocess
+import torchaudio
+import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class MELDDataset(Dataset):
@@ -14,10 +15,8 @@ class MELDDataset(Dataset):
         self,
         csv_path: str,
         video_dir: str,
-        max_frames: int = 30,
         max_text_len: int = 128,
     ):
-        # Anchor everything to THIS file's location
         base_dir = Path(__file__).resolve().parent
 
         self.csv_path = (base_dir / csv_path).resolve()
@@ -30,85 +29,68 @@ class MELDDataset(Dataset):
             raise FileNotFoundError(f"Video directory not found: {self.video_dir}")
 
         self.data = pd.read_csv(self.csv_path)
-
-        self.max_frames = max_frames
         self.max_text_len = max_text_len
-
         self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
-        self.emotion_map = {
-            "anger": 0,
-            "disgust": 1,
-            "sadness": 2,
-            "joy": 3,
-            "neutral": 4,
-            "surprise": 5,
-            "fear": 6,
-        }
-
-        self.sentiment_map = {
-            "negative": 0,
-            "neutral": 1,
-            "positive": 2,
-        }
-        
-        
-    def __extract__audio__features(self, video_path: Path) -> Path:
-        video_path = Path(video_path)
+    def _extract_audio(self, video_path: Path) -> torch.Tensor:
         audio_path = video_path.with_suffix(".wav")
 
-        
+
         try:
-            subprocess.run([
-                'ffmpeg',
-                '-i', video_path,
-                '-vn',
-                '-anodec', 'pcm_s16le',
-                '-ar', '16000',
-                '-ac', '1',
-                audio_path
-            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-             raise ValueError(f"Audio Error: {str(e)}")
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i", str(video_path),
+                    "-vn",
+                    "-acodec", "pcm_s16le",
+                    "-ar", "16000",
+                    "-ac", "1",
+                    str(audio_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            
+            waveform, sample_rate = torchaudio.load(audio_path)
+            
+            if sample_rate != 16000:
+                waveform = torchaudio.transforms.Resample(sample_rate, 16000)(waveform)
+                
+                
+            mel_spec = torchaudio.transforms.MelSpectrogram(
+                sample_rate=16000,
+                n_mels=64,
+                n_fft=1024,
+                hop_length=512
+            )(waveform)
+                            
+            
+            mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-6)
+            
+            if mel_spec.size(2) < 300:
+                mel_spec = torch.nn.functional.pad(mel_spec, (0, 300 - mel_spec.size(2)))
+            else:
+                mel_spec = mel_spec[: , : , :300]
+                
+            return mel_spec.squeeze(0)
+            
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"ffmpeg failed for {video_path}") from e
+
+        except FileNotFoundError:
+            raise RuntimeError("ffmpeg not found. Install it with: brew install ffmpeg")
+
+        finally:
+        # 6️⃣ Cleanup
+            if audio_path.exists():
+                audio_path.unlink()
+    
+    
 
     def __len__(self):
         return len(self.data)
-
-    def _load_video_frames(self, video_path: Path) -> torch.Tensor:
-        cap = cv2.VideoCapture(str(video_path))
-        frames = []
-
-        try:
-            if not cap.isOpened():
-                raise ValueError(f"Cannot open video: {video_path}")
-
-            while len(frames) < self.max_frames:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                frame = cv2.resize(frame, (224, 224))
-                frame = frame.astype(np.float32) / 255.0  # correct normalization
-                frames.append(frame)
-
-        finally:
-            cap.release()
-
-        if len(frames) == 0:
-            raise ValueError(f"No frames extracted from {video_path}")
-
-        # Pad or truncate
-        if len(frames) < self.max_frames:
-            pad = [np.zeros_like(frames[0])] * (self.max_frames - len(frames))
-            frames.extend(pad)
-        else:
-            frames = frames[: self.max_frames]
-
-        # (T, H, W, C) → (T, C, H, W)
-        frames = torch.from_numpy(np.array(frames)).permute(0, 3, 1, 2)
-        
-
-        return frames
 
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
@@ -119,28 +101,20 @@ class MELDDataset(Dataset):
         if not video_path.exists():
             raise FileNotFoundError(f"Video not found: {video_path}")
 
-        text = row["Utterance"]
-
         text_inputs = self.tokenizer(
-            text,
+            row["Utterance"],
             padding="max_length",
             truncation=True,
             max_length=self.max_text_len,
-            return_tensors="pt", 
+            return_tensors="pt",
         )
 
-        # video_frames = self._load_video_frames(video_path)
-        self.__extract__audio__features(video_path)
-
-        emotion_label = self.emotion_map.get(row["Emotion"].lower(), -1)
-        sentiment_label = self.sentiment_map.get(row["Sentiment"].lower(), -1)
+        audio_features = self._extract_audio(video_path)
 
         return {
             "input_ids": text_inputs["input_ids"].squeeze(0),
             "attention_mask": text_inputs["attention_mask"].squeeze(0),
-            "video": video_frames,
-            "emotion": torch.tensor(emotion_label, dtype=torch.long),
-            "sentiment": torch.tensor(sentiment_label, dtype=torch.long),
+            "audio_path": str(audio_features),
         }
 
 
@@ -149,6 +123,6 @@ if __name__ == "__main__":
         csv_path="../meld-dataset/MELD-RAW/MELD.Raw/dev/dev_sent_emo.csv",
         video_dir="../meld-dataset/MELD-RAW/MELD.Raw/dev/dev_splits_complete",
     )
-    
+
     sample = dataset[0]
     print(sample)
