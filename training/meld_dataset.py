@@ -1,12 +1,25 @@
 from pathlib import Path
-
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import cv2
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 import subprocess
+from torch.utils.data import default_collate
+
+
+
+def collate_fn(batch):
+    # Remove failed samples (None)
+    batch = [b for b in batch if b is not None]
+
+    if len(batch) == 0:
+        return None
+
+    return default_collate(batch)
 
 
 class MELDDataset(Dataset):
@@ -39,11 +52,11 @@ class MELDDataset(Dataset):
         self.emotion_map = {
             "anger": 0,
             "disgust": 1,
-            "sadness": 2,
+            "fear": 2,
             "joy": 3,
             "neutral": 4,
-            "surprise": 5,
-            "fear": 6,
+            "sadness": 5,
+            "surprise": 6,
         }
 
         self.sentiment_map = {
@@ -63,13 +76,22 @@ class MELDDataset(Dataset):
                 'ffmpeg',
                 '-i', video_path,
                 '-vn',
-                '-anodec', 'pcm_s16le',
+                '-acodec', 'pcm_s16le',
                 '-ar', '16000',
                 '-ac', '1',
                 audio_path
             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            
+            
         except Exception as e:
              raise ValueError(f"Audio Error: {str(e)}")
+         
+        audio_tensor = torch.zeros(1)
+        if audio_path.exists():
+            audio_path.unlink()
+
+        return audio_tensor
 
     def __len__(self):
         return len(self.data)
@@ -111,44 +133,119 @@ class MELDDataset(Dataset):
         return frames
 
     def __getitem__(self, idx):
+        
+        if isinstance(idx, torch.Tensor):
+            idx=idx.item()
         row = self.data.iloc[idx]
+        try:
+            video_name = f"dia{row['Dialogue_ID']}_utt{row['Utterance_ID']}.mp4"
+            video_path = self.video_dir / video_name
 
-        video_name = f"dia{row['Dialogue_ID']}_utt{row['Utterance_ID']}.mp4"
-        video_path = self.video_dir / video_name
+            if not video_path.exists():
+                raise FileNotFoundError(f"Video not found: {video_path}")
 
-        if not video_path.exists():
-            raise FileNotFoundError(f"Video not found: {video_path}")
+            text = row["Utterance"]
 
-        text = row["Utterance"]
+            text_inputs = self.tokenizer(
+                text,
+                padding="max_length",
+                truncation=True,
+                max_length=self.max_text_len,
+                return_tensors="pt", 
+            )
 
-        text_inputs = self.tokenizer(
-            text,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_text_len,
-            return_tensors="pt", 
-        )
+            video_frames = self._load_video_frames(video_path)
+            audio_features = self.__extract__audio__features(video_path)
+            
+            
+            # Map Sentiment
+            
 
-        # video_frames = self._load_video_frames(video_path)
-        self.__extract__audio__features(video_path)
+            emotion_label = self.emotion_map.get(row["Emotion"].lower(), )
+            sentiment_label = self.sentiment_map.get(row["Sentiment"].lower(), )
 
-        emotion_label = self.emotion_map.get(row["Emotion"].lower(), -1)
-        sentiment_label = self.sentiment_map.get(row["Sentiment"].lower(), -1)
+            return {
+                    "text_inputs":{
+                    "input_ids": text_inputs["input_ids"].squeeze(0),
+                    "attention_mask": text_inputs["attention_mask"].squeeze(0),
+                                    },
+                "video": video_frames,
+                'audio_features': audio_features,
+                "emotion_label": torch.tensor(emotion_label, dtype=torch.long),
+                "sentiment_label": torch.tensor(sentiment_label, dtype=torch.long),
+            }
+        except Exception as e:
+            print(f"Error processing {video_path} : {str(e)}")
+            return None
 
-        return {
-            "input_ids": text_inputs["input_ids"].squeeze(0),
-            "attention_mask": text_inputs["attention_mask"].squeeze(0),
-            "video": video_frames,
-            "emotion": torch.tensor(emotion_label, dtype=torch.long),
-            "sentiment": torch.tensor(sentiment_label, dtype=torch.long),
-        }
+
+def collate_fn(batch):
+    # Remove failed samples (None)
+    batch = [b for b in batch if b is not None]
+
+    if len(batch) == 0:
+        return None
+
+    return default_collate(batch)
 
 
-if __name__ == "__main__":
-    dataset = MELDDataset(
-        csv_path="../meld-dataset/MELD-RAW/MELD.Raw/dev/dev_sent_emo.csv",
-        video_dir="../meld-dataset/MELD-RAW/MELD.Raw/dev/dev_splits_complete",
+
+
+
+def prepare_dataloaders(train_csv, train_video_dir,dev_csv, dev_video_dir, test_csv, test_video_dir, batch_size=32):
+    train_dataset = MELDDataset(train_csv, train_video_dir)
+    dev_dataset = MELDDataset(dev_csv, dev_video_dir)
+    test_dataset = MELDDataset(test_csv, test_video_dir)
+    
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,   # keep 0 for now
     )
     
-    sample = dataset[0]
-    print(sample)
+    dev_loader = DataLoader(
+        dev_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+    )
+    
+    
+    
+    return train_loader,dev_loader, test_loader
+    
+    
+    
+    
+    
+    
+
+if __name__ == "__main__":
+    train_loader, dev_loader, test_loader = prepare_dataloaders(
+        "../meld-dataset/MELD-RAW/MELD.Raw/train/train_sent_emo.csv",
+        "../meld-dataset/MELD-RAW/MELD.Raw/train/train_splits",
+        "../meld-dataset/MELD-RAW/MELD.Raw/dev/dev_sent_emo.csv",
+        "../meld-dataset/MELD-RAW/MELD.Raw/dev/dev_splits_complete",
+         "../meld-dataset/MELD-RAW/MELD.Raw/test/test_sent_emo.csv",
+        "../meld-dataset/MELD-RAW/MELD.Raw/test/output_repeated_splits_test",
+    )
+    
+    for batch in train_loader:
+        print(batch['text_inputs'])
+        print(batch['video_frames'].shape)
+        print(batch['audio_features'].shape)
+        print(batch['emotion_label'])
+        print(batch['sentiment_label'])
+        break
