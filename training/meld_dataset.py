@@ -9,6 +9,8 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 import subprocess
 from torch.utils.data import default_collate
+import torchaudio
+
 
 
 
@@ -82,7 +84,7 @@ class MELDDataset(Dataset):
         except Exception as e:
              raise ValueError(f"Audio Error: {str(e)}")
          
-        audio_tensor = torch.zeros(1)
+        audio_tensor = torch.zeros(64, 300)
         if audio_path.exists():
             audio_path.unlink()
 
@@ -92,6 +94,9 @@ class MELDDataset(Dataset):
         return len(self.data)
 
     def _load_video_frames(self, video_path: Path) -> torch.Tensor:
+        
+        audio_path = video_path.with_suffix(".wav")
+
         cap = cv2.VideoCapture(str(video_path))
         frames = []
 
@@ -188,7 +193,7 @@ class MELDDataset(Dataset):
                     "input_ids": text_inputs["input_ids"].squeeze(0),
                     "attention_mask": text_inputs["attention_mask"].squeeze(0),
                                     },
-                "video": video_frames,
+                "video_frames": video_frames,
                 'audio_features': audio_features,
                 "emotion_label": torch.tensor(emotion_label, dtype=torch.long),
                 "sentiment_label": torch.tensor(sentiment_label, dtype=torch.long),
