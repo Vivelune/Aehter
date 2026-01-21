@@ -10,3 +10,7 @@ __pycache__/
 meld-dataset/
 
 # Training outputs (if you don’t want them in Git)
+
+
+# TensorBoard logs
+runs/
