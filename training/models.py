@@ -2,9 +2,11 @@ import torch
 import torch.nn as nn
 from transformers import BertModel
 from torchvision import models as vision_models
-from meld_dataset import MELDDataset
+from training.meld_dataset import MELDDataset
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
-
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+import os
 
 class TextEncoder (nn.Module):
     def __init__(self):
@@ -164,13 +166,19 @@ class MultimodalTrainer:
         print(f"Validation Samples : {val_size:,}")
         print(f"Batches per epoch : {len(train_loader):,}")
         
+        timestamp = datetime.now().strftime('%b%d_%H-%M-%S')
+        base_dir = "/opt/ml/output/tensorboard" if "SM_NODEL_DIR" in os.environ else 'runs'
+        log_dir = f"{base_dir}/run_{timestamp}"
+        self.writer =SummaryWriter(log_dir=log_dir)
+        self.global_step = 0
+        
         self.optimizer = torch.optim.Adam([
-            {'params' : model.text_encoder.parameteres(), 'lr' : 8e-6},
-            {'params' : model.video_encoder.parameteres(), 'lr' : 8e-5},
-            {'params' : model.audio_encoder.parameteres(), 'lr' : 8e-5},
-            {'params' : model.fusion_layer.parameteres(), 'lr' : 5e-4},
-            {'params' : model.emotion_classifier.parameteres(), 'lr' : 5e-4},
-            {'params' : model.sentiment_classifier.parameteres(), 'lr' : 5e-4}
+            {'params' : model.text_encoder.parameters(), 'lr' : 8e-6},
+            {'params' : model.video_encoder.parameters(), 'lr' : 8e-5},
+            {'params' : model.audio_encoder.parameters(), 'lr' : 8e-5},
+            {'params' : model.fusion_layer.parameters(), 'lr' : 5e-4},
+            {'params' : model.emotion_classifier.parameters(), 'lr' : 5e-4},
+            {'params' : model.sentiment_classifier.parameters(), 'lr' : 5e-4}
         ], weight_decay=1e-5)
 
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -180,6 +188,8 @@ class MultimodalTrainer:
             patience=2,
             
         )
+        
+        self.current_train_losses = None
 
 
         self.emotion_criterion = nn.CrossEntropyLoss(
@@ -190,6 +200,27 @@ class MultimodalTrainer:
         self.sentiment_criterion = nn.CrossEntropyLoss(
             label_smoothing=0.05
         )
+    
+    
+    def log_metrics(self, losses, metrics=None, phase="train"):
+        if phase == "train":
+            self.current_train_losses = losses
+        else:
+            self.writer.add_scalar('loss/total/train', self.current_train_losses['total'], self.global_step)
+            self.writer.add_scalar('loss/total/val', losses['total'], self.global_step)
+            
+            self.writer.add_scalar('loss/emotion/train', self.current_train_losses['emotion'], self.global_step)
+            self.writer.add_scalar('loss/emotion/val', losses['emotion'], self.global_step)
+            
+            self.writer.add_scalar('loss/sentiment/train', self.current_train_losses['sentiment'], self.global_step)
+            self.writer.add_scalar('loss/sentiment/val', losses['sentiment'], self.global_step)
+            
+        if metrics:
+            self.writer.add_scalar(f'{phase}/emotion_precision', metrics['emotion_precision'], self.global_step)
+            self.writer.add_scalar(f'{phase}/emotion_accuracy', metrics['emotion_accuracy'], self.global_step)
+            self.writer.add_scalar(f'{phase}/sentiment_precision', metrics['sentiment_precision'], self.global_step)
+            self.writer.add_scalar(f'{phase}/sentiment_accuracy', metrics['sentiment_accuracy'], self.global_step)
+            
     
     def train_epoch(self):
         self.model.train()
@@ -228,20 +259,28 @@ class MultimodalTrainer:
             running_loss['emotion'] += emotion_loss.item()
             running_loss['sentiment'] += sentiment_loss.item()
             
+            self.log_metrics({
+                'total': total_loss.item(),
+                'emotion':emotion_loss.item(),
+                'sentiment': sentiment_loss.item(),
+            })
+            
+            self.global_step += 1
+            
         
         return { k: v/len(self.train_loader) for k , v in running_loss.items() }
 
 
-    def validate(self):
+    def evaluate(self, data_loader, phase="val"):
         self.model.eval()
-        val_loss = {'total': 0, 'emotion': 0, 'sentiment':0}
+        losses = {'total': 0, 'emotion': 0, 'sentiment':0}
         all_emotion_preds = []
         all_emotion_labels= []
         all_sentiment_preds = []
         all_sentiment_label = []
         
         with torch.inference_mode():
-            for batch in self.val_loader:
+            for batch in data_loader:
                 device = next(self.model.parameters()).device
                 text_inputs = {
                 'input_ids': batch['text_inputs']['input_ids'].to(device),
@@ -270,11 +309,11 @@ class MultimodalTrainer:
                 all_sentiment_label.extend(sentiment_label.cpu().numpy())
                 
 
-                val_loss['total'] += total_loss.item()
-                val_loss['emotion'] += emotion_loss.item()
-                val_loss['sentiment'] += sentiment_loss.item()
-                    
-        avg_loss = {k:v/len(self.val_loader) for k, v in val_loss.items()}
+                losses['total'] += total_loss.item()
+                losses['emotion'] += emotion_loss.item()
+                losses['sentiment'] += sentiment_loss.item()
+                   
+        avg_loss = {k:v/len(data_loader) for k, v in losses.items()}
         
         emotion_precision = precision_score(
             all_emotion_labels, all_emotion_preds, average='weighted'
@@ -291,7 +330,16 @@ class MultimodalTrainer:
             all_sentiment_label, all_sentiment_preds
         )
         
-        self.scheduler.step(avg_loss['total'])
+        self.log_metrics(avg_loss,{
+            'emotion_precision' : emotion_precision,
+            'emotion_accuracy':emotion_accuracy,
+            'sentiment_precision' : sentiment_precision,
+            'sentiment_accuracy':sentiment_accuracy
+            
+        }, phase=phase)
+        
+        if phase == "val":
+            self.scheduler.step(avg_loss['total'])
         
         return avg_loss, {
             'emotion_precision' : emotion_precision,
