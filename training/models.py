@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import BertModel
 from torchvision import models as vision_models
-from training.meld_dataset import MELDDataset
+from meld_dataset import MELDDataset
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime

@@ -1,7 +1,7 @@
 from collections import namedtuple
 import torch
 from torch.utils.data import DataLoader
-from training.models import MultimodalSentimentModel, MultimodalTrainer
+from models import MultimodalSentimentModel, MultimodalTrainer
 
 
 def test_logging():
